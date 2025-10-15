@@ -1,0 +1,373 @@
+' === Outlook VBA: Lean invoice attachment saver (classic Outlook) ===
+' Implements: new unread mail only, addressed to caseyw@ttcexcavation.com,
+' attachment-first gating, then sender/subject/body, then (names → contents),
+' save attachments, and keep matching mail Unread.
+Option Explicit
+
+' ----------------------------- SETTINGS -----------------------------
+Private Const SAVE_PATH As String = "Z:\New Invoices (VBA)\"          ' Where to save attachments
+Private Const TARGET_SMTP_ADDR As String = "caseyw@ttcexcavation.com" ' Only process mail addressed to this
+Private Const SCAN_ATTACHMENT_CONTENTS As Boolean = True              ' True = read DOC/DOCX/RTF/PDF via Word
+' --------------------------------------------------------------------
+
+' ---- Event wires used only to re-mark items Unread when viewed -----
+Private WithEvents OlExp As Outlook.Explorer
+Private WithEvents OlInsps As Outlook.Inspectors
+
+' Track matched items so we can force them back to Unread on select/open
+Private MatchedIds As Object            ' Scripting.Dictionary keyed by EntryID
+
+' Lazy Word application (only created if content scan is needed)
+Private gWord As Object                 ' Word.Application
+
+' ========================= STARTUP / WIRING =========================
+Private Sub Application_Startup()
+    ' Hook Explorer/Inspector events and ensure target folder exists.
+    On Error Resume Next
+    Set OlExp = Application.ActiveExplorer
+    Set OlInsps = Application.Inspectors
+    If MatchedIds Is Nothing Then Set MatchedIds = CreateObject("Scripting.Dictionary")
+    EnsureFolder SAVE_PATH
+End Sub
+
+' Re-run wiring without restart (Immediate window: ResetWatcher)
+Public Sub ResetWatcher()
+    Application_Startup
+End Sub
+
+' ===================== NEW MAIL (ONLY real NEW) =====================
+' Fires once per new incoming item AFTER rules run (so vendor folders are covered).
+Private Sub Application_NewMailEx(ByVal EntryIDCollection As String)
+    Dim ids As Variant, i As Long
+    ids = Split(EntryIDCollection, ",") ' Usually a single EntryID; split for safety
+
+    For i = LBound(ids) To UBound(ids)
+        On Error Resume Next
+        Dim itm As Object
+        Set itm = Application.Session.GetItemFromID(ids(i))
+        On Error GoTo 0
+
+        If Not itm Is Nothing Then
+            If TypeName(itm) = "MailItem" Then
+                ProcessNewMail itm
+            End If
+        End If
+    Next i
+End Sub
+
+' --------------- CORE PIPELINE FOR A SINGLE NEW MAIL ----------------
+Private Sub ProcessNewMail(ByVal mail As Outlook.MailItem)
+    On Error GoTo QuietExit
+
+    ' 0) Only NEW unread mail (NewMailEx guarantees new; still guard UnRead)
+    If Not mail.UnRead Then GoTo QuietExit
+
+    ' 1) Only items addressed to our target address (To/CC; best-effort BCC/Received-By)
+    If Not IsAddressedToTarget(mail, TARGET_SMTP_ADDR) Then GoTo QuietExit
+
+    ' 2) Attachment-first gating (skip quickly if no attachment)
+    If mail.Attachments.Count = 0 Then GoTo QuietExit
+
+    ' 3) Check SENDER EMAIL + SUBJECT + BODY for keywords (fastest meaningful match)
+    If Not HasKeywordInSenderSubjectBody(mail) Then GoTo QuietExit
+
+    ' === At this point we have a hit; save all attachments immediately ===
+    SaveAllAttachments mail, SAVE_PATH
+
+    ' Remember & keep Unread (even when viewed)
+    mail.UnRead = True
+    mail.Save
+    If MatchedIds Is Nothing Then Set MatchedIds = CreateObject("Scripting.Dictionary")
+    MatchedIds(mail.EntryID) = True
+
+    ' 4) Now (and only now) inspect attachment names, then (optionally) contents.
+    '    This is intentionally AFTER saving attachments to minimize latency.
+    Dim kw As Variant: kw = GetKeywords()
+    Dim a As Outlook.Attachment, nameHit As Boolean
+
+    For Each a In mail.Attachments
+        Dim fn As String: fn = LCase$(a.FileName)
+        If MatchesAny(fn, NormalizeText(fn), kw) Then
+            nameHit = True
+            Exit For
+        End If
+    Next
+
+    If SCAN_ATTACHMENT_CONTENTS And Not nameHit Then
+        For Each a In mail.Attachments
+            ' Best-effort: read TXT/CSV/LOG directly; DOC/DOCX/RTF/PDF via Word
+            If AttachmentHasKeyword(a, kw) Then Exit For
+        Next
+    End If
+
+QuietExit:
+    ' No UI, no errors; exit quietly
+End Sub
+
+' ===================== UNREAD BEHAVIOR WHEN VIEWED ==================
+Private Sub OlExp_SelectionChange()
+    ' If a matching message is selected in the Reading Pane, force Unread
+    On Error Resume Next
+    Dim sel As Outlook.Selection, i As Long
+    Set sel = OlExp.Selection
+    For i = 1 To sel.Count
+        If TypeName(sel.Item(i)) = "MailItem" Then
+            Dim mi As Outlook.MailItem: Set mi = sel.Item(i)
+            If Not MatchedIds Is Nothing Then
+                If MatchedIds.Exists(mi.EntryID) Then mi.UnRead = True: mi.Save
+            End If
+        End If
+    Next
+End Sub
+
+Private Sub OlInsps_NewInspector(ByVal Inspector As Inspector)
+    ' If a matching message is opened in its own window, force Unread
+    On Error Resume Next
+    If TypeName(Inspector.CurrentItem) = "MailItem" Then
+        Dim mi As Outlook.MailItem: Set mi = Inspector.CurrentItem
+        If Not MatchedIds Is Nothing Then
+            If MatchedIds.Exists(mi.EntryID) Then mi.UnRead = True: mi.Save
+        End If
+    End If
+End Sub
+
+' ======================= ADDRESSING FILTER ==========================
+' Decide if the message is addressed to TARGET in To/CC (and best-effort BCC).
+' NOTE: For received mail, true BCC recipients are typically not exposed to the
+' Outlook Object Model (servers strip BCC). We supplement with PR_RECEIVED_BY_EMAIL_ADDRESS.
+Private Function IsAddressedToTarget(ByVal mail As Outlook.MailItem, ByVal target As String) As Boolean
+    On Error Resume Next
+    Dim t As String: t = LCase$(Trim$(target))
+
+    ' Try transport "received by" properties (works in many environments)
+    Dim pa As Outlook.PropertyAccessor
+    Set pa = mail.PropertyAccessor
+    Dim recvBy As String, recvRep As String
+    recvBy = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0076001E"))  ' PR_RECEIVED_BY_EMAIL_ADDRESS
+    recvRep = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0078001E")) ' PR_RECEIVED_REPRESENTING_EMAIL_ADDRESS
+    If recvBy = t Or recvRep = t Then IsAddressedToTarget = True: Exit Function
+
+    ' Check To/CC recipients
+    Dim r As Outlook.Recipient, smtp As String
+    For Each r In mail.Recipients
+        ' Only To or CC types (1=To, 2=CC, 3=BCC; BCC usually not available on received items)
+        If r.Type = olTo Or r.Type = olCC Or r.Type = olBCC Then
+            smtp = LCase$(RecipientSmtp(r))
+            If smtp = t Then IsAddressedToTarget = True: Exit Function
+        End If
+    Next
+
+    ' Fallback: loose check in the display strings
+    If InStr(1, LCase$(mail.To), t, vbTextCompare) > 0 Then IsAddressedToTarget = True: Exit Function
+    If InStr(1, LCase$(mail.CC), t, vbTextCompare) > 0 Then IsAddressedToTarget = True: Exit Function
+
+    IsAddressedToTarget = False
+End Function
+
+' Extract SMTP for a recipient (Exchange-safe)
+Private Function RecipientSmtp(ByVal r As Outlook.Recipient) As String
+    On Error Resume Next
+    Dim pa As Outlook.PropertyAccessor
+    Set pa = r.PropertyAccessor
+    Dim smtp As String
+    smtp = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001E") ' PR_SMTP_ADDRESS
+    If Len(smtp) = 0 Then
+        Dim ae As Outlook.AddressEntry
+        Set ae = r.AddressEntry
+        If Not ae Is Nothing Then
+            If LCase$(ae.Type) = "ex" Then
+                Dim eu As Outlook.ExchangeUser
+                Set eu = ae.GetExchangeUser
+                If Not eu Is Nothing Then smtp = eu.PrimarySmtpAddress Else smtp = r.Address
+            Else
+                smtp = r.Address
+            End If
+        End If
+    End If
+    RecipientSmtp = smtp
+End Function
+
+' ================== FAST CHECK: SENDER+SUBJECT+BODY =================
+Private Function HasKeywordInSenderSubjectBody(ByVal mail As Outlook.MailItem) As Boolean
+    On Error Resume Next
+
+    ' Sender SMTP (robust across Exchange/SMTP)
+    Dim senderSmtp As String: senderSmtp = GetSenderSmtp(mail)
+
+    ' Build a compact corpus: sender + subject + body
+    Dim raw As String
+    raw = LCase$(senderSmtp & " " & mail.Subject & " " & mail.Body)
+    Dim norm As String: norm = NormalizeText(raw)
+
+    HasKeywordInSenderSubjectBody = MatchesAny(raw, norm, GetKeywords())
+End Function
+
+' Primary SMTP for the sender (Exchange-friendly)
+Private Function GetSenderSmtp(ByVal mail As Outlook.MailItem) As String
+    On Error Resume Next
+    Dim s As String
+    If LCase$(mail.SenderEmailType) = "ex" Then
+        Dim eu As Outlook.ExchangeUser
+        Set eu = mail.Sender.GetExchangeUser
+        If Not eu Is Nothing Then s = eu.PrimarySmtpAddress Else s = mail.SenderEmailAddress
+    Else
+        s = mail.SenderEmailAddress
+    End If
+    GetSenderSmtp = LCase$(s)
+End Function
+
+' ===================== KEYWORD MATCHING HELPERS =====================
+Private Function MatchesAny(ByVal raw As String, ByVal norm As String, ByVal keywords As Variant) As Boolean
+    Dim i As Long, k As String, padded As String
+    padded = " " & norm & " "
+    For i = LBound(keywords) To UBound(keywords)
+        k = keywords(i)
+        If HasNonAlnum(k) Then
+            If InStr(1, raw, k, vbTextCompare) > 0 Then MatchesAny = True: Exit Function
+        Else
+            If InStr(1, padded, " " & k & " ", vbTextCompare) > 0 Then MatchesAny = True: Exit Function
+        End If
+    Next
+    MatchesAny = False
+End Function
+
+Private Function NormalizeText(ByVal s As String) As String
+    Dim i As Long, t As Variant
+    s = LCase$(s)
+    t = Array(vbCr, vbLf, ".", ",", ";", ":", "/", "\", "#", "-", "_", "(", ")", "[", "]", "{", "}", "|", "+", "=", "*", """", "'", "!", "?", "~", "`", "@", "&")
+    For i = LBound(t) To UBound(t)
+        s = Replace$(s, CStr(t(i)), " ")
+    Next
+    Do While InStr(s, "  ") > 0
+        s = Replace$(s, "  ", " ")
+    Loop
+    NormalizeText = Trim$(s)
+End Function
+
+Private Function HasNonAlnum(ByVal s As String) As Boolean
+    Dim i As Long, ch As String
+    For i = 1 To Len(s)
+        ch = Mid$(s, i, 1)
+        If Not (ch Like "[0-9A-Za-z]") Then HasNonAlnum = True: Exit Function
+    Next
+    HasNonAlnum = False
+End Function
+
+' ================== ATTACHMENT NAME / CONTENT CHECKS =================
+' NOTE: We run these ONLY AFTER sender+subject+body matched (for performance).
+Private Function AttachmentHasKeyword(ByVal a As Outlook.Attachment, ByVal kw As Variant) As Boolean
+    On Error GoTo CleanExit
+
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim tmp As String
+    tmp = Environ$("TEMP") & "\invscan_" & Format(Now, "yyyymmddhhnnss") & "_" & CStr(Int(Rnd() * 100000)) & "_" & Sanitize(a.FileName)
+    a.SaveAsFile tmp
+
+    Dim ext As String: ext = LCase$(fso.GetExtensionName(tmp))
+    Dim txt As String
+
+    Select Case ext
+        Case "txt", "csv", "log": txt = ReadAll(tmp)
+        Case "doc", "docx", "rtf", "pdf": txt = ReadWithWord(tmp) ' via Word converter (if available)
+        Case Else: txt = ""
+    End Select
+
+    If Len(txt) > 0 Then
+        AttachmentHasKeyword = MatchesAny(LCase$(txt), NormalizeText(txt), kw)
+    Else
+        AttachmentHasKeyword = False
+    End If
+
+CleanExit:
+    On Error Resume Next
+    If Len(tmp) > 0 Then
+        If fso.FileExists(tmp) Then fso.DeleteFile tmp, True
+    End If
+End Function
+
+Private Function ReadAll(ByVal path As String) As String
+    On Error GoTo Fail
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim ts As Object: Set ts = fso.OpenTextFile(path, 1, False, -2)
+    ReadAll = ts.ReadAll
+    ts.Close
+    Exit Function
+Fail:
+    ReadAll = ""
+End Function
+
+Private Function ReadWithWord(ByVal path As String) As String
+    On Error GoTo Fail
+    Dim wd As Object: Set wd = GetWord()
+    If wd Is Nothing Then GoTo Fail
+    Dim d As Object: Set d = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
+    ReadWithWord = d.Content.Text
+    d.Close False
+    Exit Function
+Fail:
+    ReadWithWord = ""
+End Function
+
+Private Function GetWord() As Object
+    On Error Resume Next
+    If gWord Is Nothing Then
+        Set gWord = GetObject(, "Word.Application")
+        If gWord Is Nothing Then Set gWord = CreateObject("Word.Application")
+        If Not gWord Is Nothing Then gWord.Visible = False: gWord.DisplayAlerts = 0
+    End If
+    Set GetWord = gWord
+End Function
+
+' ========================= SAVE ATTACHMENTS ==========================
+Private Sub SaveAllAttachments(ByVal mail As Outlook.MailItem, ByVal dest As String)
+    On Error Resume Next
+    EnsureFolder dest
+    Dim a As Outlook.Attachment, path As String
+    For Each a In mail.Attachments
+        path = UniquePath(dest, Sanitize(a.FileName))
+        a.SaveAsFile path
+    Next
+End Sub
+
+' ============================== UTILS ================================
+Private Sub EnsureFolder(ByVal p As String)
+    On Error Resume Next
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(p) Then fso.CreateFolder p
+End Sub
+
+Private Function Sanitize(ByVal name As String) As String
+    Dim bad As Variant, i As Long
+    bad = Array("<", ">", ":", """", "/", "\", "|", "?", "*")
+    For i = LBound(bad) To UBound(bad): name = Replace$(name, bad(i), "_"): Next
+    Do While Right$(name, 1) = "." Or Right$(name, 1) = " ": name = Left$(name, Len(name) - 1): Loop
+    If Len(name) = 0 Then name = "attachment"
+    Sanitize = name
+End Function
+
+Private Function UniquePath(ByVal folder As String, ByVal file As String) As String
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim base As String, ext As String, i As Long, candidate As String
+    If Right$(folder, 1) <> "\" Then folder = folder & "\"
+    base = fso.GetBaseName(file): ext = fso.GetExtensionName(file): If Len(ext) > 0 Then ext = "." & ext
+    candidate = folder & base & ext
+    If Not fso.FileExists(candidate) Then UniquePath = candidate: Exit Function
+    i = 1
+    Do
+        candidate = folder & base & " (" & CStr(i) & ")" & ext
+        i = i + 1
+    Loop While fso.FileExists(candidate)
+    UniquePath = candidate
+End Function
+
+' =========================== KEYWORDS ===============================
+' Exactly your list (lower-cased)
+Private Function GetKeywords() As Variant
+    Dim txt As String
+    txt = "invoice,invoices,invoice#,invoice no,invoice no.,invoice num,invoice number,invoice id,invoice-id,invoice ref,invoice reference,inv,inv.,inv#,inv no,inv no.,inv num,invnum,inv id,inv-id,inv ref,inv reference,tax invoice,tax inv,tax inv.,vat invoice,vat inv,gst invoice,gst inv,proforma invoice,pro-forma invoice,pro forma invoice,proforma inv,pro-forma inv,pro forma inv,pfi,sales invoice,supplier invoice,purchase invoice," & _
+          "bill,bills,bill.,bill#,bill no,bill no.,bill num,bill number,bill id,bill-id,bill ref,bill reference,billed,billing,billing statement,statement,statement of account,soa,stmt,stmt.,statement#,statement no,statement num,statement number," & _
+          "past due,past-due,pastdue,over due,over-due,overdue,late,late fee,late charge,late payment,delinquent,delinquency,delinq,delinq.,delq,delq.,arrears,arrear,arrearage,arrearages,in arrears,past-due amount,past due amount,amount past due,balance past due,payment past due,overdue balance,balance overdue," & _
+          "outstanding,outstanding amt,outstanding amount,outstanding balance,amount outstanding,outst,outst.,o/s,open,open invoice,open invoices,open balance,unpaid,unpaid invoice,unpaid invoices,unpaid balance,unpaid amount,total due,amount due,amt due,balance due,bal due,bal.,bal,due,due now,due immediately,due upon receipt,due on receipt,due date,remaining balance,balance remaining,due balance,payment due,aging,ageing,aged,aging balance,aged balance,aged trial balance," & _
+          "collection,collections,collect,collects,collector,coll,coll.,collections dept,collections department,credit control,credit and collections,credit & collections,accounts receivable,ar,a/r,receivable,receivables,ar dept,ar department,collection notice,collection letter,past due notice,overdue notice,dunning,dunning letter,dunning notice,payment reminder,reminder,reminder notice,final notice,final demand,demand letter,collection agency,external collections,debt collection,debt collector,debt collectors,debt recovery,recovery,recoveries,recover,pre-collection,precollection"
+    GetKeywords = Split(LCase$(txt), ",")
+End Function
