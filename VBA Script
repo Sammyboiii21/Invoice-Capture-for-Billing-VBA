@@ -1,14 +1,20 @@
 ' === Outlook VBA: Lean invoice attachment saver (classic Outlook) ===
 ' Implements: new unread mail only, addressed to caseyw@ttcexcavation.com,
 ' attachment-first gating, then sender/subject/body, then (names → contents),
-' save attachments, and keep matching mail Unread.
-Option Compare Text   ' <— UPDATE: make module-wide string comparisons case-insensitive
+' save attachments (skipping inline/small signature images), and keep matching mail Unread.
+Option Compare Text   ' module-wide case-insensitive comparisons
 Option Explicit
 
 ' ----------------------------- SETTINGS -----------------------------
-Private Const SAVE_PATH As String = "Z:\New Invoices (VBA)\"          ' Where to save attachments
-Private Const TARGET_SMTP_ADDR As String = "caseyw@ttcexcavation.com" ' Only process mail addressed to this
-Private Const SCAN_ATTACHMENT_CONTENTS As Boolean = True              ' True = read DOC/DOCX/RTF/PDF via Word
+Private Const SAVE_PATH As String = "Z:\New Invoices (VBA)\"              ' Where to save attachments
+Private Const TARGET_SMTP_ADDR As String = "caseyw@ttcexcavation.com"     ' Only process mail addressed to this
+Private Const SCAN_ATTACHMENT_CONTENTS As Boolean = True                  ' True = read TXT + DOC/DOCX/RTF/PDF via Word
+Private Const SCAN_EXCEL_CONTENTS As Boolean = False                      ' Toggle Excel workbook content scan (XLS/XLSX/XLSM/XLSB)
+
+' --- Inline/Signature filtering ---
+Private Const SKIP_INLINE_ATTACHMENTS As Boolean = True                   ' Skip attachments flagged inline (Content-ID / hidden / content-location)
+Private Const SKIP_SMALL_INLINE_IMAGES As Boolean = True                  ' Skip tiny inline images (signature logos, etc.)
+Private Const SMALL_IMAGE_MAX_BYTES As Long = 60 * 1024                   ' 60 KB threshold for tiny images
 ' --------------------------------------------------------------------
 
 ' ---- Event wires used only to re-mark items Unread when viewed -----
@@ -18,8 +24,9 @@ Private WithEvents OlInsps As Outlook.Inspectors
 ' Track matched items so we can force them back to Unread on select/open
 Private MatchedIds As Object            ' Scripting.Dictionary keyed by EntryID
 
-' Lazy Word application (only created if content scan is needed)
-Private gWord As Object                 ' Word.Application
+' Lazy automation apps (created only if needed)
+Private gWord As Object                 ' Word.Application (for DOC/DOCX/RTF/PDF)
+Private gExcel As Object                ' Excel.Application (for XLS/XLSX/XLSM/XLSB)
 
 ' ========================= STARTUP / WIRING =========================
 Private Sub Application_Startup()
@@ -72,7 +79,7 @@ Private Sub ProcessNewMail(ByVal mail As Outlook.MailItem)
     ' 3) Check SENDER EMAIL + SUBJECT + BODY for keywords (fastest meaningful match)
     If Not HasKeywordInSenderSubjectBody(mail) Then GoTo QuietExit
 
-    ' === At this point we have a hit; save all attachments immediately ===
+    ' === At this point we have a hit; save all qualifying attachments immediately ===
     SaveAllAttachments mail, SAVE_PATH
 
     ' Remember & keep Unread (even when viewed)
@@ -87,17 +94,21 @@ Private Sub ProcessNewMail(ByVal mail As Outlook.MailItem)
     Dim a As Outlook.Attachment, nameHit As Boolean
 
     For Each a In mail.Attachments
-        Dim fn As String: fn = LCase$(a.FileName)
-        If MatchesAny(fn, NormalizeText(fn), kw) Then
-            nameHit = True
-            Exit For
+        If Not ShouldSkipAttachment(a) Then
+            Dim fn As String: fn = LCase$(a.FileName)
+            If MatchesAny(fn, NormalizeText(fn), kw) Then
+                nameHit = True
+                Exit For
+            End If
         End If
     Next
 
     If SCAN_ATTACHMENT_CONTENTS And Not nameHit Then
         For Each a In mail.Attachments
-            ' Best-effort: read TXT/CSV/LOG directly; DOC/DOCX/RTF/PDF via Word
-            If AttachmentHasKeyword(a, kw) Then Exit For
+            If Not ShouldSkipAttachment(a) Then
+                ' Best-effort: read TXT/CSV/LOG directly; DOC/DOCX/RTF/PDF via Word; (optional) Excel
+                If AttachmentHasKeyword(a, kw) Then Exit For
+            End If
         Next
     End If
 
@@ -254,38 +265,118 @@ Private Function HasNonAlnum(ByVal s As String) As Boolean
     HasNonAlnum = False
 End Function
 
+' ================= FILTERS: INLINE/SIGNATURE & SIZE THRESHOLDS =================
+Private Function ShouldSkipAttachment(ByVal a As Outlook.Attachment) As Boolean
+    On Error Resume Next
+
+    ' Skip inline attachments (Content-ID / Hidden / Content-Location)
+    If SKIP_INLINE_ATTACHMENTS Then
+        If IsInlineAttachment(a) Then ShouldSkipAttachment = True: Exit Function
+    End If
+
+    ' Skip tiny inline images by size + typical image extensions (signature logos)
+    If SKIP_SMALL_INLINE_IMAGES Then
+        Dim ext As String: ext = GetExt(a.FileName)
+        If IsImageExt(ext) Then
+            If a.Size <= SMALL_IMAGE_MAX_BYTES Then
+                ShouldSkipAttachment = True
+                Exit Function
+            End If
+        End If
+    End If
+
+    ShouldSkipAttachment = False
+End Function
+
+Private Function IsInlineAttachment(ByVal a As Outlook.Attachment) As Boolean
+    On Error Resume Next
+    Dim pa As Outlook.PropertyAccessor
+    Set pa = a.PropertyAccessor
+
+    ' PR_ATTACH_CONTENT_ID (ANSI) and PR_ATTACH_CONTENT_LOCATION (ANSI)
+    Dim cid As String, cloc As String
+    cid = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001E")
+    cloc = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3713001E")
+
+    ' PR_ATTACHMENT_HIDDEN (Boolean)
+    Dim isHidden As Boolean
+    isHidden = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x7FFE000B")
+
+    ' If any inline signals present, treat as inline
+    If (Len(cid) > 0) Or (Len(cloc) > 0) Or isHidden Then
+        IsInlineAttachment = True
+    Else
+        IsInlineAttachment = False
+    End If
+End Function
+
+Private Function IsImageExt(ByVal ext As String) As Boolean
+    ext = LCase$(ext)
+    Select Case ext
+        Case "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "ico", "svg", "wmf", "emf", "webp", "heic"
+            IsImageExt = True
+        Case Else
+            IsImageExt = False
+    End Select
+End Function
+
+Private Function GetExt(ByVal fileName As String) As String
+    Dim p As Long: p = InStrRev(fileName, ".")
+    If p > 0 Then GetExt = LCase$(Mid$(fileName, p + 1)) Else GetExt = ""
+End Function
+
 ' ================== ATTACHMENT NAME / CONTENT CHECKS =================
 ' NOTE: We run these ONLY AFTER sender+subject+body matched (for performance).
 Private Function AttachmentHasKeyword(ByVal a As Outlook.Attachment, ByVal kw As Variant) As Boolean
     On Error GoTo CleanExit
 
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    ' Respect skip rules here too (avoid scanning inline/signature files)
+    If ShouldSkipAttachment(a) Then AttachmentHasKeyword = False: Exit Function
+
     Dim tmp As String
     tmp = Environ$("TEMP") & "\invscan_" & Format(Now, "yyyymmddhhnnss") & "_" & CStr(Int(Rnd() * 100000)) & "_" & Sanitize(a.FileName)
     a.SaveAsFile tmp
 
-    Dim ext As String: ext = LCase$(fso.GetExtensionName(tmp))
+    Dim ext As String: ext = GetExt(tmp)
     Dim txt As String
 
     Select Case ext
-        Case "txt", "csv", "log": txt = ReadAll(tmp)
-        Case "doc", "docx", "rtf", "pdf": txt = ReadWithWord(tmp) ' via Word converter (if available)
-        Case Else: txt = ""
-    End Select
+        Case "txt", "csv", "log"
+            txt = ReadAll(tmp)
+            If Len(txt) > 0 Then
+                AttachmentHasKeyword = MatchesAny(LCase$(txt), NormalizeText(txt), kw)
+            Else
+                AttachmentHasKeyword = False
+            End If
 
-    If Len(txt) > 0 Then
-        AttachmentHasKeyword = MatchesAny(LCase$(txt), NormalizeText(txt), kw)
-    Else
-        AttachmentHasKeyword = False
-    End If
+        Case "doc", "docx", "rtf", "pdf"
+            txt = ReadWithWord(tmp) ' via Word converter (if available)
+            If Len(txt) > 0 Then
+                AttachmentHasKeyword = MatchesAny(LCase$(txt), NormalizeText(txt), kw)
+            Else
+                AttachmentHasKeyword = False
+            End If
+
+        Case "xls", "xlsx", "xlsm", "xlsb"
+            If SCAN_EXCEL_CONTENTS Then
+                AttachmentHasKeyword = ExcelWorkbookContains(tmp, kw)
+            Else
+                AttachmentHasKeyword = False
+            End If
+
+        Case Else
+            AttachmentHasKeyword = False
+    End Select
 
 CleanExit:
     On Error Resume Next
     If Len(tmp) > 0 Then
+        Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
         If fso.FileExists(tmp) Then fso.DeleteFile tmp, True
     End If
 End Function
 
+' --- Read helpers ---
 Private Function ReadAll(ByVal path As String) As String
     On Error GoTo Fail
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
@@ -298,7 +389,7 @@ Fail:
 End Function
 
 Private Function ReadWithWord(ByVal path As String) As String
-    On Error GoTo Fail
+    On Error Go To Fail
     Dim wd As Object: Set wd = GetWord()
     If wd Is Nothing Then GoTo Fail
     Dim d As Object: Set d = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
@@ -309,6 +400,50 @@ Fail:
     ReadWithWord = ""
 End Function
 
+' --- Excel content scanning (optional) ---
+Private Function ExcelWorkbookContains(ByVal path As String, ByVal kw As Variant) As Boolean
+    On Error GoTo EH
+    Dim xl As Object: Set xl = GetExcel()
+    If xl Is Nothing Then GoTo EH
+
+    Dim wb As Object: Set wb = xl.Workbooks.Open(path, False, True) ' ReadOnly
+    Dim ws As Object, arr, r As Long, c As Long
+
+    For Each ws In wb.Worksheets
+        arr = ws.UsedRange.Value
+        If IsArray(arr) Then
+            For r = LBound(arr, 1) To UBound(arr, 1)
+                For c = LBound(arr, 2) To UBound(arr, 2)
+                    If LenB(arr(r, c)) <> 0 Then
+                        Dim cellText As String
+                        cellText = LCase$(CStr(arr(r, c)))
+                        If MatchesAny(cellText, NormalizeText(cellText), kw) Then
+                            ExcelWorkbookContains = True
+                            wb.Close False
+                            Exit Function
+                        End If
+                    End If
+                Next c
+            Next r
+        Else
+            Dim singleVal As String
+            singleVal = LCase$(CStr(arr))
+            If MatchesAny(singleVal, NormalizeText(singleVal), kw) Then
+                ExcelWorkbookContains = True
+                wb.Close False
+                Exit Function
+            End If
+        End If
+    Next ws
+
+    wb.Close False
+    ExcelWorkbookContains = False
+    Exit Function
+EH:
+    ExcelWorkbookContains = False
+End Function
+
+' --- Lazy apps ---
 Private Function GetWord() As Object
     On Error Resume Next
     If gWord Is Nothing Then
@@ -319,14 +454,26 @@ Private Function GetWord() As Object
     Set GetWord = gWord
 End Function
 
+Private Function GetExcel() As Object
+    On Error Resume Next
+    If gExcel Is Nothing Then
+        Set gExcel = GetObject(, "Excel.Application")
+        If gExcel Is Nothing Then Set gExcel = CreateObject("Excel.Application")
+        If Not gExcel Is Nothing Then gExcel.Visible = False: gExcel.DisplayAlerts = False
+    End If
+    Set GetExcel = gExcel
+End Function
+
 ' ========================= SAVE ATTACHMENTS ==========================
 Private Sub SaveAllAttachments(ByVal mail As Outlook.MailItem, ByVal dest As String)
     On Error Resume Next
     EnsureFolder dest
     Dim a As Outlook.Attachment, path As String
     For Each a In mail.Attachments
-        path = UniquePath(dest, Sanitize(a.FileName))
-        a.SaveAsFile path
+        If Not ShouldSkipAttachment(a) Then
+            path = UniquePath(dest, Sanitize(a.FileName))
+            a.SaveAsFile path
+        End If
     Next
 End Sub
 
