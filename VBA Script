@@ -2,6 +2,7 @@
 ' Implements: new unread mail only, addressed to caseyw@ttcexcavation.com,
 ' attachment-first gating, then sender/subject/body, then (names → contents),
 ' save attachments, and keep matching mail Unread.
+Option Compare Text   ' <— UPDATE: make module-wide string comparisons case-insensitive
 Option Explicit
 
 ' ----------------------------- SETTINGS -----------------------------
