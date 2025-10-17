@@ -389,8 +389,7 @@ Fail:
 End Function
 
 Private Function ReadWithWord(ByVal path As String) As String
-    On Error GoTo ErrHandler
-
+    On Error GoTo Fail
     Dim wd As Object: Set wd = GetWord()
     Dim doc As Object
 
