@@ -1,7 +1,8 @@
-' === Outlook VBA: Lean invoice attachment saver (classic Outlook) ===
+' === Outlook VBA: Lean invoice attachment saver (classic Outlook) — hardened ===
 ' Implements: new unread mail only, addressed to caseyw@ttcexcavation.com,
 ' attachment-first gating, then sender/subject/body, then (names → contents),
 ' save attachments (skipping inline/small signature images), and keep matching mail Unread.
+
 Option Compare Text   ' module-wide case-insensitive comparisons
 Option Explicit
 
@@ -36,11 +37,19 @@ Private Sub Application_Startup()
     Set OlInsps = Application.Inspectors
     If MatchedIds Is Nothing Then Set MatchedIds = CreateObject("Scripting.Dictionary")
     EnsureFolder SAVE_PATH
+    Randomize ' seed RNG for temp filename suffixes
 End Sub
 
 ' Re-run wiring without restart (Immediate window: ResetWatcher)
 Public Sub ResetWatcher()
     Application_Startup
+End Sub
+
+' Tidy up hidden apps on exit
+Private Sub Application_Quit()
+    On Error Resume Next
+    If Not gWord Is Nothing Then gWord.Quit: Set gWord = Nothing
+    If Not gExcel Is Nothing Then gExcel.Quit: Set gExcel = Nothing
 End Sub
 
 ' ===================== NEW MAIL (ONLY real NEW) =====================
@@ -52,7 +61,7 @@ Private Sub Application_NewMailEx(ByVal EntryIDCollection As String)
     For i = LBound(ids) To UBound(ids)
         On Error Resume Next
         Dim itm As Object
-        Set itm = Application.Session.GetItemFromID(ids(i))
+        Set itm = GetItemByEntryID(ids(i))  ' robust across multiple stores
         On Error GoTo 0
 
         If Not itm Is Nothing Then
@@ -62,6 +71,24 @@ Private Sub Application_NewMailEx(ByVal EntryIDCollection As String)
         End If
     Next i
 End Sub
+
+' Try to get an item by EntryID across all stores (multi-account safe)
+Private Function GetItemByEntryID(ByVal id As String) As Object
+    Dim ns As Outlook.NameSpace: Set ns = Application.Session
+    Dim itm As Object, st As Object
+    On Error Resume Next
+
+    ' Default store fast-path
+    Set itm = ns.GetItemFromID(id)
+    If Not itm Is Nothing Then Set GetItemByEntryID = itm: Exit Function
+
+    ' Other stores
+    For Each st In ns.Stores
+        Err.Clear
+        Set itm = ns.GetItemFromID(id, st.StoreID)
+        If Not itm Is Nothing Then Set GetItemByEntryID = itm: Exit Function
+    Next
+End Function
 
 ' --------------- CORE PIPELINE FOR A SINGLE NEW MAIL ----------------
 Private Sub ProcessNewMail(ByVal mail As Outlook.MailItem)
@@ -132,11 +159,11 @@ Private Sub OlExp_SelectionChange()
     Next
 End Sub
 
-Private Sub OlInsps_NewInspector(ByVal Inspector As Inspector)
+Private Sub OlInsps_NewInspector(ByVal Insp As Outlook.Inspector)
     ' If a matching message is opened in its own window, force Unread
     On Error Resume Next
-    If TypeName(Inspector.CurrentItem) = "MailItem" Then
-        Dim mi As Outlook.MailItem: Set mi = Inspector.CurrentItem
+    If TypeName(Insp.CurrentItem) = "MailItem" Then
+        Dim mi As Outlook.MailItem: Set mi = Insp.CurrentItem
         If Not MatchedIds Is Nothing Then
             If MatchedIds.Exists(mi.EntryID) Then mi.UnRead = True: mi.Save
         End If
@@ -151,18 +178,22 @@ Private Function IsAddressedToTarget(ByVal mail As Outlook.MailItem, ByVal targe
     On Error Resume Next
     Dim t As String: t = LCase$(Trim$(target))
 
-    ' Try transport "received by" properties (works in many environments)
+    ' Try transport "received by" properties (Unicode first, fallback to ANSI)
     Dim pa As Outlook.PropertyAccessor
     Set pa = mail.PropertyAccessor
     Dim recvBy As String, recvRep As String
-    recvBy = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0076001E"))  ' PR_RECEIVED_BY_EMAIL_ADDRESS
-    recvRep = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0078001E")) ' PR_RECEIVED_REPRESENTING_EMAIL_ADDRESS
+
+    recvBy = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0076001F"))  ' PR_RECEIVED_BY_EMAIL_ADDRESS (Unicode)
+    If Len(recvBy) = 0 Then recvBy = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0076001E"))  ' ANSI
+
+    recvRep = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0078001F")) ' PR_RECEIVED_REPRESENTING_EMAIL_ADDRESS (Unicode)
+    If Len(recvRep) = 0 Then recvRep = LCase$(pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x0078001E")) ' ANSI
+
     If recvBy = t Or recvRep = t Then IsAddressedToTarget = True: Exit Function
 
-    ' Check To/CC recipients
+    ' Check To/CC/BCC recipients (BCC often not available on received items)
     Dim r As Outlook.Recipient, smtp As String
     For Each r In mail.Recipients
-        ' Only To or CC types (1=To, 2=CC, 3=BCC; BCC usually not available on received items)
         If r.Type = olTo Or r.Type = olCC Or r.Type = olBCC Then
             smtp = LCase$(RecipientSmtp(r))
             If smtp = t Then IsAddressedToTarget = True: Exit Function
@@ -181,8 +212,12 @@ Private Function RecipientSmtp(ByVal r As Outlook.Recipient) As String
     On Error Resume Next
     Dim pa As Outlook.PropertyAccessor
     Set pa = r.PropertyAccessor
+
     Dim smtp As String
-    smtp = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001E") ' PR_SMTP_ADDRESS
+    ' PR_SMTP_ADDRESS (Unicode first then ANSI)
+    smtp = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001F")
+    If Len(smtp) = 0 Then smtp = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x39FE001E")
+
     If Len(smtp) = 0 Then
         Dim ae As Outlook.AddressEntry
         Set ae = r.AddressEntry
@@ -190,12 +225,17 @@ Private Function RecipientSmtp(ByVal r As Outlook.Recipient) As String
             If LCase$(ae.Type) = "ex" Then
                 Dim eu As Outlook.ExchangeUser
                 Set eu = ae.GetExchangeUser
-                If Not eu Is Nothing Then smtp = eu.PrimarySmtpAddress Else smtp = r.Address
+                If Not eu Is Nothing Then
+                    smtp = eu.PrimarySmtpAddress
+                Else
+                    smtp = r.Address
+                End If
             Else
                 smtp = r.Address
             End If
         End If
     End If
+
     RecipientSmtp = smtp
 End Function
 
@@ -293,21 +333,20 @@ Private Function IsInlineAttachment(ByVal a As Outlook.Attachment) As Boolean
     Dim pa As Outlook.PropertyAccessor
     Set pa = a.PropertyAccessor
 
-    ' PR_ATTACH_CONTENT_ID (ANSI) and PR_ATTACH_CONTENT_LOCATION (ANSI)
+    ' PR_ATTACH_CONTENT_ID and PR_ATTACH_CONTENT_LOCATION (Unicode first, then ANSI)
     Dim cid As String, cloc As String
-    cid = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001E")
-    cloc = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3713001E")
+    cid = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001F")
+    If Len(cid) = 0 Then cid = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001E")
+
+    cloc = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3713001F")
+    If Len(cloc) = 0 Then cloc = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3713001E")
 
     ' PR_ATTACHMENT_HIDDEN (Boolean)
     Dim isHidden As Boolean
     isHidden = pa.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x7FFE000B")
 
     ' If any inline signals present, treat as inline
-    If (Len(cid) > 0) Or (Len(cloc) > 0) Or isHidden Then
-        IsInlineAttachment = True
-    Else
-        IsInlineAttachment = False
-    End If
+    IsInlineAttachment = (Len(cid) > 0) Or (Len(cloc) > 0) Or isHidden
 End Function
 
 Private Function IsImageExt(ByVal ext As String) As Boolean
@@ -388,14 +427,16 @@ Fail:
     ReadAll = ""
 End Function
 
+' Fixed + hardened: avoids bad labels and resume-without-error
 Private Function ReadWithWord(ByVal path As String) As String
-    On Error GoTo Fail
-    Dim wd As Object: Set wd = GetWord()
-    Dim doc As Object
+    Dim wd As Object, doc As Object
+    On Error GoTo EH
 
-    If wd Is Nothing Then GoTo ErrHandler
+    Set wd = GetWord()
+    If wd Is Nothing Then GoTo CleanExit   ' no Word available → return ""
 
-    Set doc = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
+    Set doc = wd.Documents.Open(FileName:=path, ReadOnly:=True, _
+                                ConfirmConversions:=False, AddToRecentFiles:=False)
     ReadWithWord = doc.Content.Text
 
 CleanExit:
@@ -404,7 +445,7 @@ CleanExit:
     Set doc = Nothing
     Exit Function
 
-ErrHandler:
+EH:
     ReadWithWord = ""
     Resume CleanExit
 End Function
