@@ -389,14 +389,18 @@ Fail:
 End Function
 
 Private Function ReadWithWord(ByVal path As String) As String
-    On Error Go To Fail
+    On Error GoTo ErrHandler
+
     Dim wd As Object: Set wd = GetWord()
-    If wd Is Nothing Then GoTo Fail
-    Dim d As Object: Set d = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
+    If wd Is Nothing Then GoTo ErrHandler
+
+    Dim d As Object
+    Set d = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
     ReadWithWord = d.Content.Text
     d.Close False
     Exit Function
-Fail:
+
+ErrHandler:
     ReadWithWord = ""
 End Function
 
