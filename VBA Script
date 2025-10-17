@@ -391,13 +391,22 @@ End Function
 Private Function ReadWithWord(ByVal path As String) As String
     On Error GoTo Fail
     Dim wd As Object: Set wd = GetWord()
-    If wd Is Nothing Then GoTo Fail
-    Dim d As Object: Set d = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
-    ReadWithWord = d.Content.Text
-    d.Close False
+    Dim doc As Object
+
+    If wd Is Nothing Then GoTo ErrHandler
+
+    Set doc = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
+    ReadWithWord = doc.Content.Text
+
+CleanExit:
+    On Error Resume Next
+    If Not doc Is Nothing Then doc.Close False
+    Set doc = Nothing
     Exit Function
-Fail:
+
+ErrHandler:
     ReadWithWord = ""
+    Resume CleanExit
 End Function
 
 ' --- Excel content scanning (optional) ---
