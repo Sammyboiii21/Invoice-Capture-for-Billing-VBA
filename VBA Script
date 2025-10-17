@@ -389,7 +389,7 @@ Fail:
 End Function
 
 Private Function ReadWithWord(ByVal path As String) As String
-    On Error Go To Fail
+    On Error GoTo Fail
     Dim wd As Object: Set wd = GetWord()
     If wd Is Nothing Then GoTo Fail
     Dim d As Object: Set d = wd.Documents.Open(FileName:=path, ReadOnly:=True, ConfirmConversions:=False, AddToRecentFiles:=False)
